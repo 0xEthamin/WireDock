@@ -1,0 +1,43 @@
+[package]
+name         = "wiredock"
+version      = "0.1.0"
+edition      = "2024"
+rust-version = "1.95"
+description  = "Interactive CLI to test software over TCP and Unix-domain sockets."
+license      = "AGPL-3.0-only"
+authors      = ["Ethamin"]
+
+[dependencies]
+# Async runtime. Features pinned to what wiredock actually uses: multi-thread
+# scheduler, tokio::net (TcpStream / UnixStream / listeners), AsyncReadExt /
+# AsyncWriteExt, mpsc + oneshot channels, Ctrl+C handler, #[tokio::main], and
+# tokio::time for small sleeps. "full" is deliberately avoided to minimize
+# compile time and audit surface.
+tokio = { version = "1.52", default-features = false, features = [
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "sync",
+    "signal",
+    "macros",
+    "time",
+] }
+
+# Typed error enums. One enum per layer (DomainError, InfraError, ReplError).
+# No anyhow. thiserror is proc-macro only; no runtime surface.
+thiserror = "2.0"
+
+# Interactive line editor with external-print primitive used by the display
+# task to print async events without corrupting the current input line.
+# Locked-in architectural decision.
+reedline = { version = "0.47", features = ["external_printer"] }
+
+[profile.release]
+lto           = "thin"
+codegen-units = 1
+panic         = "abort"
+strip         = "symbols"
+
+[profile.dev]
+opt-level = 0
+debug     = true
