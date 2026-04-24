@@ -5,7 +5,6 @@
 //! cancelled with `JoinHandle::abort()` only; no cancellation tokens.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::io::AsyncReadExt;
@@ -151,9 +150,10 @@ where
                                         {
                                             parse_remote_port(addr)
                                         }
-                                        PeerInfo::IpcPid { .. } =>
+                                        PeerInfo::IpcPid { .. } | PeerInfo::IpcRemotePath { .. } =>
                                         {
-                                            // Not expected on a TCP accept loop.
+                                            // Not expected on a TCP accept loop: IPC peer variants cannot
+                                            // originate from a TcpListener. Ignore defensively.
                                             None
                                         }
                                     };
@@ -223,7 +223,6 @@ where
             {
                 Ok(mut al) =>
                 {
-                    reg.ipc_paths.insert(path.clone());
                     let accept_tx = input_tx.clone();
                     let parent_id = id.clone();
                     let parent_path = path.clone();
@@ -253,9 +252,10 @@ where
                                                 stream:    accepted.stream,
                                             }).await;
                                         }
-                                        PeerInfo::TcpSocket { .. } =>
+                                        PeerInfo::TcpSocket { .. } | PeerInfo::IpcRemotePath { .. } =>
                                         {
-                                            // Not expected on IPC accept loop.
+                                            // Not expected on an IPC accept loop: a UnixListener only produces
+                                            // IpcPid peers. Ignore defensively.
                                         }
                                     }
                                 }
@@ -319,7 +319,6 @@ where
                         stream,
                         Some(peer.clone()),
                         None,
-                        None,
                         input_tx.clone(),
                     );
                     reg.insert_stream(handle);
@@ -331,32 +330,22 @@ where
                 Err(e) => CommandOutcome::err(e.to_string()),
             }
         }
-        Command::OpenIpcClient { local_path, remote_path } =>
+        Command::OpenIpcClient { remote_path } =>
         {
-            let id = ConnectionId::IpcClient { local_path: local_path.clone() };
-            if reg.streams.contains_key(&id) || reg.servers.contains_key(&id)
-            {
-                return CommandOutcome::err(
-                    DomainError::IdAlreadyInUse(local_path.display().to_string()).to_string(),
-                );
-            }
-            let endpoint = Endpoint::Ipc
-            {
-                local_path:  local_path.clone(),
-                remote_path: remote_path.clone(),
-            };
+            let seq = reg.alloc_ipc_client_seq();
+            let id  = ConnectionId::IpcClient { seq };
+            // By construction (monotonic seq) this id cannot collide.
+            let endpoint = Endpoint::Ipc { remote_path: remote_path.clone() };
             match connector.connect(endpoint).await
             {
                 Ok(stream) =>
                 {
-                    reg.ipc_paths.insert(local_path.clone());
-                    let peer = PeerInfo::IpcPid { pid: 0 }; // unknown for clients
+                    let peer = PeerInfo::IpcRemotePath { path: remote_path.clone() };
                     let handle = spawn_stream(
                         id.clone(),
                         stream,
                         Some(peer),
                         None,
-                        Some(local_path.clone()),
                         input_tx.clone(),
                     );
                     reg.insert_stream(handle);
@@ -364,15 +353,12 @@ where
                         "[{id}] connected to {}",
                         remote_path.display()
                     ))).await;
-                    CommandOutcome::ok(format!("ipc client {id} connected"))
+                    CommandOutcome::ok(format!(
+                        "ipc client {id} connected to {}",
+                        remote_path.display()
+                    ))
                 }
-                Err(e) =>
-                {
-                    // Best-effort cleanup of the sentinel local file if the
-                    // connector created it.
-                    let _ = std::fs::remove_file(&local_path);
-                    CommandOutcome::err(e.to_string())
-                }
+                Err(e) => CommandOutcome::err(e.to_string()),
             }
         }
         Command::Close { id_token } =>
@@ -500,7 +486,6 @@ async fn handle_accepted(
         stream,
         Some(peer_info.clone()),
         Some(parent.clone()),
-        None,
         input_tx.clone(),
     );
     reg.insert_stream(handle);
@@ -516,15 +501,13 @@ async fn handle_accepted(
 /// The read task is strictly I/O: it reads up to 64 KiB, forwards bytes, and
 /// forwards `Closed`/`Error` lifecycle events. No business logic here.
 fn spawn_stream(
-    id:             ConnectionId,
-    stream:         BoxedStream,
-    peer_info:      Option<PeerInfo>,
-    parent:         Option<ConnectionId>,
-    local_ipc_path: Option<PathBuf>,
-    input_tx:       mpsc::Sender<RegistryInput>,
+    id:        ConnectionId,
+    stream:    BoxedStream,
+    peer_info: Option<PeerInfo>,
+    parent:    Option<ConnectionId>,
+    input_tx:  mpsc::Sender<RegistryInput>,
 ) -> StreamHandle
 {
-    // Consume the boxed stream; split into read/write halves.
     let (mut reader, writer) = tokio::io::split(stream);
     let writer_box: BoxedStream = Box::new(WriterHalf { writer });
 
@@ -577,7 +560,6 @@ fn spawn_stream(
         stream: writer_box,
         read_task,
         parent,
-        local_ipc_path,
     }
 }
 

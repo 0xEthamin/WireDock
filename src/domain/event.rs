@@ -17,10 +17,15 @@ pub enum PeerInfo
     {
         addr: String,
     },
-    /// IPC peer: PID resolved via SO_PEERCRED.
+    /// IPC peer identified by PID (accepted side, via SO_PEERCRED).
     IpcPid
     {
         pid: i32,
+    },
+    /// IPC peer identified by the remote socket path (client side).
+    IpcRemotePath
+    {
+        path: std::path::PathBuf,
     },
 }
 
@@ -31,8 +36,9 @@ impl PeerInfo
     {
         match self
         {
-            Self::TcpSocket { addr } => addr.clone(),
-            Self::IpcPid    { pid }  => format!("pid={pid}"),
+            Self::TcpSocket     { addr } => addr.clone(),
+            Self::IpcPid        { pid }  => format!("pid={pid}"),
+            Self::IpcRemotePath { path } => path.display().to_string(),
         }
     }
 }
@@ -152,3 +158,4 @@ impl CommandOutcome
         Self { success: false, message: msg.into() }
     }
 }
+

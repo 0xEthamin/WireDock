@@ -1,8 +1,4 @@
 //! User commands after parsing.
-//!
-//! The REPL layer produces values of this enum from raw input. The registry
-//! consumes them and never re-parses strings except for the payload-target
-//! id, which is resolved against the registry's id/label tables.
 
 use std::path::PathBuf;
 
@@ -30,10 +26,11 @@ pub enum Command
         remote_port: u16,
     },
 
-    /// `open ipc client <local_path> <remote_path>`
+    /// `open ipc client <remote_path>`
+    ///
+    /// No local path: the registry assigns a sequence id at open time.
     OpenIpcClient
     {
-        local_path:  PathBuf,
         remote_path: PathBuf,
     },
 

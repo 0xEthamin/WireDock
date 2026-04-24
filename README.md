@@ -88,8 +88,10 @@ To interact with a connection, you must use its **Connection ID**. `wiredock` en
 
 ### IPC (Unix Sockets) IDs
 - **Server:** Its local path (e.g., `/tmp/server.sock`).
-- **Client:** Its local bound path (e.g., `/tmp/client.sock`).
-- **Accepted Connection:** `<server_path>.<pid>`. Derived via `SO_PEERCRED` (e.g., `/tmp/server.sock.12345`). Suffixes are added upon PID collision.
+- **Client:** Auto-assigned sequence id (e.g., `ipc:1`, `ipc:2`). A client
+  has no identity on the wire beyond its remote socket path; wiredock
+  assigns a short monotonic id for reference.
+- **Accepted Connection:** `<server_path>.<pid>`. Derived via `SO_PEERCRED`.
 
 ---
 
@@ -102,7 +104,7 @@ To interact with a connection, you must use its **Connection ID**. `wiredock` en
 | `open server <port>` | Start a TCP listener on the given port. |
 | `open ipc server <path>` | Start an IPC listener. Removes stale socket files automatically. |
 | `open client <local_port> <host>:<port>` | Open a TCP client bound to `local_port`, connecting to `host:port`. |
-| `open ipc client <local_path> <remote_path>` | Open an IPC client bound to `local_path`, connecting to `remote_path`. |
+| `open ipc client <remote_path>` | Open an IPC client connecting to `remote_path`. Assigns `ipc:<n>`. |
 | `close <id>` | Close a connection. Closing a server triggers a **cascading close** of all its accepted children and removes the socket file (if IPC). |
 
 ### Sending Data

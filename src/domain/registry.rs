@@ -31,8 +31,6 @@ pub struct StreamHandle
     pub read_task: JoinHandle<()>,
     /// For accepted connections: parent server id.
     pub parent:    Option<ConnectionId>,
-    /// For IPC clients: local path to remove on close.
-    pub local_ipc_path: Option<PathBuf>,
 }
 
 /// A live server owned by the registry.
@@ -41,25 +39,22 @@ pub struct ServerHandle
     pub state:         ConnectionState,
     pub accept_task:   JoinHandle<()>,
     pub children:      HashSet<ConnectionId>,
-    /// IPC socket file path to remove on close (None for TCP).
-    pub ipc_path: Option<PathBuf>,
-    /// Per-remote-port collision counter (TCP) or per-pid (IPC).
-    /// Key: the base identifier without disambig suffix.
+    /// IPC socket file path to remove on close (None for TCP). The server
+    /// is the sole owner of this file on disk.
+    pub ipc_path:      Option<PathBuf>,
     pub disambig_next: HashMap<String, u32>,
-    /// Tracks base ids currently using no suffix, to trigger retro-renaming
-    /// on first collision.
     pub base_no_suffix: HashMap<String, ConnectionId>,
 }
 
 /// Top-level registry state.
 pub struct Registry
 {
-    pub streams:   HashMap<ConnectionId, StreamHandle>,
-    pub servers:   HashMap<ConnectionId, ServerHandle>,
+    pub streams: HashMap<ConnectionId, StreamHandle>,
+    pub servers: HashMap<ConnectionId, ServerHandle>,
     /// Label -> id (1:1).
-    pub labels:    HashMap<String, ConnectionId>,
-    /// IPC paths created by this run, cleaned up on shutdown.
-    pub ipc_paths: HashSet<PathBuf>,
+    pub labels:  HashMap<String, ConnectionId>,
+    /// Monotonic counter for IPC client sequence ids (`ipc:1`, `ipc:2`, ...).
+    next_ipc_client_seq: u32,
 }
 
 impl Default for Registry
@@ -79,8 +74,22 @@ impl Registry
             streams:   HashMap::new(),
             servers:   HashMap::new(),
             labels:    HashMap::new(),
-            ipc_paths: HashSet::new(),
+            next_ipc_client_seq: 1,
         }
+    }
+
+    /// Allocate a fresh sequence id for a new IPC client connection.
+    ///
+    /// The counter is monotonic for the lifetime of the process. It is not
+    /// reused when clients close; reusing would risk confusing users who
+    /// still have `ipc:3` in their mental state after it has been freed.
+    pub fn alloc_ipc_client_seq(&mut self) -> u32
+    {
+        let n = self.next_ipc_client_seq;
+        // invariant: u32 saturation is practically unreachable in an
+        // interactive REPL (4B clients would need to be opened).
+        self.next_ipc_client_seq = self.next_ipc_client_seq.saturating_add(1);
+        n
     }
 
     // ---------------------------------------------------------------------
@@ -117,9 +126,10 @@ impl Registry
                 let h = &self.streams[id];
                 let remote = match &h.state.peer_info
                 {
-                    Some(PeerInfo::TcpSocket { addr }) => addr.clone(),
-                    Some(PeerInfo::IpcPid    { .. })  => "(ipc peer)".to_string(),
-                    None                               => "?".to_string(),
+                    Some(PeerInfo::TcpSocket     { addr }) => addr.clone(),
+                    Some(PeerInfo::IpcRemotePath { path }) => path.display().to_string(),
+                    Some(PeerInfo::IpcPid        { .. })   => "(ipc peer)".to_string(),
+                    None                                    => "?".to_string(),
                 };
                 let state = render_status_tag(h.state.status);
                 let label = h
@@ -178,25 +188,31 @@ impl Registry
         out
     }
 
-    // ---------------------------------------------------------------------
-    // Command handling (pure state effects + write I/O).
-    //
-    // The runtime wraps this with the actual tokio plumbing. See repl::runtime.
-    // ---------------------------------------------------------------------
+    // Command handling
 
     /// Resolve a user-typed token to a registered id, preferring labels.
-    pub fn resolve_id(&self, token: &str, parser: impl Fn(&str) -> Option<ConnectionId>)
-        -> Result<ConnectionId, DomainError>
+    ///
+    /// The parser may return several plausible ids (e.g. a numeric token could
+    /// mean either a TCP server or a TCP client); we pick the one that is
+    /// actually present in the registry. Labels take precedence.
+    pub fn resolve_id
+    (
+        &self,
+        token: &str,
+        parser: impl Fn(&str) -> Vec<ConnectionId>,
+    ) -> Result<ConnectionId, DomainError>
     {
         if let Some(id) = self.labels.get(token)
         {
             return Ok(id.clone());
         }
-        if let Some(id) = parser(token)
-            && (self.streams.contains_key(&id) || self.servers.contains_key(&id))
+        for id in parser(token)
+        {
+            if self.streams.contains_key(&id) || self.servers.contains_key(&id)
             {
                 return Ok(id);
             }
+        }
         Err(DomainError::UnknownId(token.to_string()))
     }
 
@@ -282,17 +298,12 @@ impl Registry
             h.read_task.abort();
             if let Some(parent) = &h.parent
                 && let Some(srv) = self.servers.get_mut(parent)
-                {
-                    srv.children.remove(id);
-                }
-            // Drop on the stream closes the OS socket.
-            drop(h.stream);
-            if let Some(path) = h.local_ipc_path
             {
-                let _ = std::fs::remove_file(&path);
-                self.ipc_paths.remove(&path);
+                srv.children.remove(id);
             }
-            // Free label.
+            // Drop on the stream closes the OS socket. No file to remove:
+            // only IPC servers own a socket file on disk.
+            drop(h.stream);
             let maybe_label = h.state.label.clone();
             if let Some(l) = maybe_label
             {
@@ -319,8 +330,8 @@ impl Registry
             }
             if let Some(path) = srv.ipc_path
             {
+                // The server owns the socket file; remove it explicitly.
                 let _ = std::fs::remove_file(&path);
-                self.ipc_paths.remove(&path);
             }
             if let Some(l) = srv.state.label
             {
@@ -427,6 +438,13 @@ impl Registry
         display: &mpsc::Sender<DisplayLine>,
     )
     {
+        if !self.streams.contains_key(id)
+        {
+            // Already dropped by an explicit `close` command; the display
+            // event has already been emitted. Avoid double CLOSED.
+            return;
+        }
+
         let name = self.display_name(id);
         self.drop_stream(id);
         let _ = display
@@ -627,12 +645,7 @@ impl Registry
         {
             self.drop_stream(&id);
         }
-        let paths: Vec<PathBuf> = self.ipc_paths.iter().cloned().collect();
-        for p in paths
-        {
-            let _ = std::fs::remove_file(&p);
-        }
-        self.ipc_paths.clear();
+        // All IPC socket files were owned by servers and removed by drop_server.
     }
 
     // ---------------------------------------------------------------------
@@ -666,45 +679,80 @@ fn render_status_tag(s: ConnectionStatus) -> &'static str
     }
 }
 
-/// Helper passed to `resolve_id`: parse a token as `u16` (TCP port), else
-/// treat it as an IPC path. Used by both REPL and send-path.
-pub fn default_token_parser(token: &str) -> Option<ConnectionId>
+/// Helper passed to `resolve_id`: produce all plausible `ConnectionId`
+/// shapes a token could refer to. `resolve_id` then picks the one that
+/// actually exists in the registry.
+///
+/// Rationale: a token like `10016` can legitimately refer to a TCP server
+/// OR a TCP client (they share the "local port" id space by design; the
+/// tool forbids opening both on the same port via the IdAlreadyInUse check
+/// at open time). Likewise a path like `/tmp/foo.sock` can be an IPC
+/// server or IPC client. The parser cannot disambiguate in isolation; only
+/// the registry's contents can.
+pub fn default_token_parser(token: &str) -> Vec<ConnectionId>
 {
+    let mut out = Vec::new();
+
+    // `ipc:<n>` -> IPC client sequence id.
+    if let Some(rest) = token.strip_prefix("ipc:")
+        && let Ok(seq) = rest.parse::<u32>()
+    {
+        out.push(ConnectionId::IpcClient { seq });
+        return out;
+    }
+
+    // Numeric token -> TCP server or TCP client local port.
     if let Ok(port) = token.parse::<u16>()
     {
-        // Can match either TCP server or TCP client; caller reconciles with
-        // the registry through `resolve_id`.
-        return Some(ConnectionId::TcpClient { local_port: port });
+        out.push(ConnectionId::TcpServer { port });
+        out.push(ConnectionId::TcpClient { local_port: port });
+        return out;
     }
-    if token.contains('.') && token.contains('#')
+
+    // `parent.remote#N` -> AcceptedTcp with disambig.
+    if let Some((left, right)) = token.split_once('#')
+        && let Some((p, r)) = left.split_once('.')
+        && let (Ok(pp), Ok(rp), Ok(n)) =
+            (p.parse::<u16>(), r.parse::<u16>(), right.parse::<u32>())
     {
-        // Best-effort: try to parse `parent.remote#N` as AcceptedTcp.
-        if let Some((left, right)) = token.split_once('#')
-            && let Some((p, r)) = left.split_once('.')
-                && let (Ok(pp), Ok(rp), Ok(n)) =
-                    (p.parse::<u16>(), r.parse::<u16>(), right.parse::<u32>())
-                {
-                    return Some(ConnectionId::AcceptedTcp
-                    {
-                        parent_port: pp,
-                        remote_port: rp,
-                        disambig:    Some(n),
-                    });
-                }
-    }
-    if let Some((left, right)) = token.rsplit_once('.')
-        && let (Ok(pp), Ok(rp)) = (left.parse::<u16>(), right.parse::<u16>())
+        out.push(ConnectionId::AcceptedTcp
         {
-            return Some(ConnectionId::AcceptedTcp
+            parent_port: pp,
+            remote_port: rp,
+            disambig:    Some(n),
+        });
+        return out;
+    }
+
+    // `parent.remote` without suffix, or `<ipc_path>.<pid>`.
+    if let Some((left, right)) = token.rsplit_once('.')
+    {
+        if let (Ok(pp), Ok(rp)) = (left.parse::<u16>(), right.parse::<u16>())
+        {
+            out.push(ConnectionId::AcceptedTcp
             {
                 parent_port: pp,
                 remote_port: rp,
                 disambig:    None,
             });
         }
+        if left.starts_with('/')
+            && let Ok(pid) = right.parse::<i32>()
+        {
+            out.push(ConnectionId::AcceptedIpc
+            {
+                parent_path: PathBuf::from(left),
+                pid,
+                disambig:    None,
+            });
+        }
+    }
+
+    // Path-like token -> IPC server (no IpcClient here: clients use ipc:<n>).
     if token.starts_with('/')
     {
-        return Some(ConnectionId::IpcClient { local_path: PathBuf::from(token) });
+        out.push(ConnectionId::IpcServer { path: PathBuf::from(token) });
     }
-    None
+
+    out
 }

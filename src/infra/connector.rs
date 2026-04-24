@@ -10,7 +10,6 @@ use crate::domain::error::DomainError;
 use crate::domain::io::BoxedStream;
 use crate::domain::transport::Connector;
 use crate::infra::error::InfraError;
-use crate::infra::fs_cleanup;
 
 /// Concrete implementation using `tokio::net`.
 #[derive(Default, Clone, Copy)]
@@ -18,8 +17,7 @@ pub struct TokioConnector;
 
 impl Connector for TokioConnector
 {
-    async fn connect
-    (
+    async fn connect(
         &self,
         endpoint: Endpoint,
     ) -> Result<BoxedStream, DomainError>
@@ -30,9 +28,9 @@ impl Connector for TokioConnector
             {
                 connect_tcp(local_port, &remote_host, remote_port).await
             }
-            Endpoint::Ipc { local_path, remote_path } =>
+            Endpoint::Ipc { remote_path } =>
             {
-                connect_ipc(local_path, remote_path).await
+                connect_ipc(remote_path).await
             }
         }
     }
@@ -87,29 +85,8 @@ async fn connect_tcp(
     Ok(Box::new(stream) as BoxedStream)
 }
 
-async fn connect_ipc(
-    local_path:  PathBuf,
-    remote_path: PathBuf,
-) -> Result<BoxedStream, DomainError>
+async fn connect_ipc(remote_path: PathBuf) -> Result<BoxedStream, DomainError>
 {
-    // Remove a stale file at the local path, then connect. The local path is
-    // bound indirectly: we do not actually bind an IPC client socket (no
-    // portable API in tokio for that), but we record the local path for id
-    // stability and cleanup. The `remote_path` is the server we connect to.
-    fs_cleanup::unlink_if_stale(&local_path);
-    // Create the file as an empty marker so `status` / re-open checks see it.
-    // We use a best-effort lock-like approach: if the file exists and is in
-    // use by a live UnixListener elsewhere, `bind()` later would fail; here
-    // we only create it as a sentinel for wiredock's own id space.
-    match std::fs::File::create(&local_path)
-    {
-        Ok(_)  => {}
-        Err(e) =>
-        {
-            return Err(InfraError::Io(e).into());
-        }
-    }
-
     let stream = UnixStream::connect(&remote_path)
         .await
         .map_err(InfraError::Io)?;

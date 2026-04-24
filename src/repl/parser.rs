@@ -143,7 +143,7 @@ fn parse_open_ipc(args: &[&str]) -> Result<Option<Command>, ReplError>
     if args.is_empty()
     {
         return Err(ReplError::Parse(
-            "usage: open ipc server <path> | open ipc client <local_path> <remote_path>"
+            "usage: open ipc server <path> | open ipc client <remote_path>"
                 .to_string(),
         ));
     }
@@ -164,16 +164,15 @@ fn parse_open_ipc(args: &[&str]) -> Result<Option<Command>, ReplError>
         }
         "client" =>
         {
-            if args.len() != 3
+            if args.len() != 2
             {
                 return Err(ReplError::Parse(
-                    "usage: open ipc client <local_path> <remote_path>".to_string(),
+                    "usage: open ipc client <remote_path>".to_string(),
                 ));
             }
             Ok(Some(Command::OpenIpcClient
             {
-                local_path:  PathBuf::from(args[1]),
-                remote_path: PathBuf::from(args[2]),
+                remote_path: PathBuf::from(args[1]),
             }))
         }
         other =>

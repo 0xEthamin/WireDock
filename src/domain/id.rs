@@ -30,10 +30,17 @@ pub enum ConnectionId
         local_port: u16,
     },
 
-    /// An outgoing IPC client bound on a local path.
+    /// An outgoing IPC client.
+    ///
+    /// Unix-domain stream clients have no real local identity on the wire
+    /// (tokio exposes no local bind API for them, and POSIX does not
+    /// require one). We therefore assign a monotonically increasing
+    /// sequence number at open time and render it as `ipc:<n>`. This keeps
+    /// the identifier short, unambiguous, and collision-free even when
+    /// several clients connect to the same remote socket.
     IpcClient
     {
-        local_path: PathBuf,
+        seq: u32,
     },
 
     /// A connection accepted by a TCP server.
@@ -81,36 +88,24 @@ impl fmt::Display for ConnectionId
             {
                 write!(f, "{local_port}")
             }
-            Self::IpcClient { local_path } =>
+            Self::IpcClient { seq } =>
             {
-                write!(f, "{}", local_path.display())
+                write!(f, "ipc:{seq}")
             }
             Self::AcceptedTcp { parent_port, remote_port, disambig } =>
             {
                 match disambig
                 {
-                    Some(n) =>
-                    {
-                        write!(f, "{parent_port}.{remote_port}#{n}")
-                    }
-                    None =>
-                    {
-                        write!(f, "{parent_port}.{remote_port}")
-                    }
+                    Some(n) => write!(f, "{parent_port}.{remote_port}#{n}"),
+                    None    => write!(f, "{parent_port}.{remote_port}"),
                 }
             }
             Self::AcceptedIpc { parent_path, pid, disambig } =>
             {
                 match disambig
                 {
-                    Some(n) =>
-                    {
-                        write!(f, "{}.{}#{}", parent_path.display(), pid, n)
-                    }
-                    None =>
-                    {
-                        write!(f, "{}.{}", parent_path.display(), pid)
-                    }
+                    Some(n) => write!(f, "{}.{}#{}", parent_path.display(), pid, n),
+                    None    => write!(f, "{}.{}", parent_path.display(), pid),
                 }
             }
         }

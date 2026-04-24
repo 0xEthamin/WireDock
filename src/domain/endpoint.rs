@@ -1,8 +1,4 @@
 //! Endpoint descriptors passed to the transport traits.
-//!
-//! Enums make inconsistent combinations (e.g. a TCP path, or an IPC host/port)
-//! unrepresentable. The transport layer branches once on the enum and calls
-//! the matching tokio API.
 
 use std::path::PathBuf;
 
@@ -18,14 +14,9 @@ pub enum Endpoint
         remote_port: u16,
     },
 
-    /// IPC client: create `local_path` (removing stale file), connect to `remote_path`.
-    ///
-    /// An IPC client does not strictly need a bound local path to connect, but
-    /// wiredock binds one anyway so the connection has a user-visible stable
-    /// identifier consistent with TCP. See REPL and registry modules.
+    /// IPC client: connect to `remote_path`. No local bind.
     Ipc
     {
-        local_path:  PathBuf,
         remote_path: PathBuf,
     },
 }
